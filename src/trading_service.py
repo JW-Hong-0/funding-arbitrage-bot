@@ -30,6 +30,8 @@ class TradingService:
         self.is_processing = False
         self.entry_timestamps: Dict[str, float] = {}
         self._entry_skip_reasons: Dict[str, Dict[str, float]] = {}
+        self.hedge_inflight: Dict[str, Dict[str, float]] = {}
+        self._hedge_net_samples: Dict[str, Dict[str, float]] = {}
 
     def _log_trade(self, order, venue: str, reason: str, signal: Optional[StrategySignal] = None):
         if not self.log_manager or not order:
@@ -93,6 +95,86 @@ class TradingService:
 
     def _market_info(self, ticker: str, venue: str) -> Dict:
         return self.monitor.ticker_info.get(ticker, {}).get(venue, {})
+
+    def _hedge_inflight_active(self, ticker: str) -> bool:
+        info = self.hedge_inflight.get(ticker)
+        if not info:
+            return False
+        if time.time() >= info.get("expires", 0):
+            self.hedge_inflight.pop(ticker, None)
+            return False
+        return True
+
+    async def _refresh_net_qty(self, ticker: str) -> float:
+        try:
+            await self.asset_manager.update_assets()
+        except Exception as e:
+            logger.warning(f"Net refresh failed for {ticker}: {e}")
+        pos = self.asset_manager.positions.get(ticker, {})
+        return float(pos.get("Net_Qty", 0.0))
+
+    async def _confirm_net_reduction(self, ticker: str, pre_net: float, qty: float, checks: int, delay_s: float) -> bool:
+        min_step = float(self._market_info(ticker, "GRVT").get("step_size", 0) or 0)
+        min_reduction = max(min_step, qty * 0.5, 0.0)
+        for _ in range(max(1, checks)):
+            await asyncio.sleep(max(0.0, delay_s))
+            net_now = await self._refresh_net_qty(ticker)
+            if abs(net_now) <= max(0.0, abs(pre_net) - min_reduction):
+                return True
+        return False
+
+    async def _execute_hedge_with_verify(
+        self,
+        ticker: str,
+        venue: str,
+        side_enum: OrderSide,
+        qty: float,
+        pre_net: float,
+        reason: str,
+    ):
+        if qty <= 0:
+            return None
+        if self._hedge_inflight_active(ticker):
+            logger.info(f"Skip hedge for {ticker}: inflight active")
+            return None
+        ttl_s = float(getattr(Config, "HEDGE_INFLIGHT_TTL_S", 60))
+        self.hedge_inflight[ticker] = {
+            "expires": time.time() + ttl_s,
+            "venue": venue,
+            "side": side_enum.value,
+            "qty": qty,
+        }
+
+        symbol = self._symbol_for_venue(ticker, venue)
+        await self._set_leverage_safe(venue, symbol, int(getattr(Config, "TARGET_LEVERAGE", 5)))
+        signal = self.monitor.signals.get(ticker)
+
+        if venue == "LGHT":
+            retries = int(getattr(Config, "HEDGE_VERIFY_RETRIES", 2))
+            delay_s = float(getattr(Config, "HEDGE_VERIFY_DELAY_S", 2))
+            for attempt in range(retries + 1):
+                order = await self.lighter.create_order(symbol, OrderType.MARKET, side_enum, qty)
+                self._log_trade(order, venue, reason, signal)
+                if await self._confirm_net_reduction(ticker, pre_net, qty, 2, delay_s):
+                    self.hedge_inflight.pop(ticker, None)
+                    return order
+                if attempt < retries:
+                    logger.warning(f"{ticker} hedge verify failed; retry {attempt + 1}/{retries}")
+            return order
+
+        if venue == "VAR" and self.variational:
+            order = await self.variational.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            self._log_trade(order, venue, reason, signal)
+            self.hedge_inflight.pop(ticker, None)
+            return order
+
+        if venue == "GRVT":
+            order = await self.grvt.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            self._log_trade(order, venue, reason, signal)
+            self.hedge_inflight.pop(ticker, None)
+            return order
+
+        return None
 
     def _global_next_event_ms(self, ticker: str, now_ms: Optional[int] = None) -> int:
         now_ms = int(now_ms or (time.time() * 1000))
@@ -216,19 +298,10 @@ class TradingService:
     async def _hedge_grvt_fill(self, ticker: str, hedge_venue: str, hedge_side: OrderSide, qty: float):
         if qty <= 0:
             return
-        symbol = self._symbol_for_venue(ticker, hedge_venue)
-        target_leverage = int(getattr(Config, "TARGET_LEVERAGE", 5))
-        await self._set_leverage_safe(hedge_venue, symbol, target_leverage)
-        signal = self.monitor.signals.get(ticker)
-        if hedge_venue == "LGHT":
-            order = await self.lighter.create_order(symbol, OrderType.MARKET, hedge_side, qty)
-            self._log_trade(order, hedge_venue, "hedge_fill", signal)
-        elif hedge_venue == "VAR" and self.variational:
-            order = await self.variational.create_order(symbol, OrderType.MARKET, hedge_side, qty)
-            self._log_trade(order, hedge_venue, "hedge_fill", signal)
-        elif hedge_venue == "GRVT":
-            order = await self.grvt.create_order(symbol, OrderType.MARKET, hedge_side, qty)
-            self._log_trade(order, hedge_venue, "hedge_fill", signal)
+        pre_net = await self._refresh_net_qty(ticker)
+        await self._execute_hedge_with_verify(
+            ticker, hedge_venue, hedge_side, qty, pre_net, "hedge_fill"
+        )
 
     async def _close_grvt_partial(self, ticker: str, order_side: OrderSide, qty: float):
         if qty <= 0:
@@ -624,6 +697,18 @@ class TradingService:
                 # Let's use generic "Hedge on Lighter/Variational" if GRVT is the heavy one.
                 
                 logger.warning(f"🚨 {ticker} Partial Hedge Detected (Net: {net_qty}). Recovery Protocol Initiated.")
+
+                now = time.time()
+                sample = self._hedge_net_samples.get(ticker)
+                if not sample or abs(sample.get("net", 0) - net_qty) > 1e-9:
+                    self._hedge_net_samples[ticker] = {"net": net_qty, "ts": now}
+                    continue
+                stable_s = float(getattr(Config, "HEDGE_NET_STABLE_S", 3))
+                if now - sample.get("ts", now) < stable_s:
+                    continue
+
+                if self._hedge_inflight_active(ticker):
+                    continue
                 
                 # Determine which venue to trade to neutralize 'net_qty'
                 # If Net > 0 (Too Long), Sell on Taker Venue (Lighter/Var).
@@ -686,19 +771,11 @@ class TradingService:
                     continue
 
                 side_enum = OrderSide.SELL if net_qty > 0 else OrderSide.BUY
-                symbol = self._symbol_for_venue(ticker, venue)
                 logger.info(f"   -> Auto-Hedging: {side_enum.value.upper()} {qty} on {venue}")
                 try:
-                    await self._set_leverage_safe(venue, symbol, int(getattr(Config, "TARGET_LEVERAGE", 5)))
-                    if venue == "GRVT":
-                        order = await self.grvt.create_order(symbol, OrderType.MARKET, side_enum, qty)
-                        self._log_trade(order, venue, "auto_hedge")
-                    elif venue == "LGHT":
-                        order = await self.lighter.create_order(symbol, OrderType.MARKET, side_enum, qty)
-                        self._log_trade(order, venue, "auto_hedge")
-                    elif venue == "VAR" and self.variational:
-                        order = await self.variational.create_order(symbol, OrderType.MARKET, side_enum, qty)
-                        self._log_trade(order, venue, "auto_hedge")
+                    await self._execute_hedge_with_verify(
+                        ticker, venue, side_enum, qty, net_qty, "auto_hedge"
+                    )
                     self.recovery_cooldowns[ticker] = time.time() + float(getattr(Config, "HEDGE_RECOVERY_COOLDOWN_S", 20))
                 except Exception as e:
                     logger.error(f"   -> Hedge Recovery Failed: {e}")

@@ -8,9 +8,16 @@ from pathlib import Path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
 repo_root = Path(project_root)
+perp_root = repo_root.parent.parent
 
 # Load env from private folder (fallback to default behavior).
-env_path = os.environ.get("BOT_ENV_PATH") or str(repo_root / "private" / "Funding_Arbitrage.env")
+env_path = os.environ.get("BOT_ENV_PATH")
+if not env_path:
+    candidate = perp_root / "private" / "Funding_Arbitrage.env"
+    if candidate.exists():
+        env_path = str(candidate)
+    else:
+        env_path = str(repo_root / "private" / "Funding_Arbitrage.env")
 os.environ.setdefault("BOT_ENV_PATH", env_path)
 if os.path.exists(env_path):
     load_dotenv(env_path)
