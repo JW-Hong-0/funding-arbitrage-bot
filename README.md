@@ -124,3 +124,22 @@ git submodule update --init --recursive
 .venv/bin/pip install -e /path/to/grvt-pysdk --no-build-isolation
 .venv/bin/pip install -e /path/to/lighter-python --no-build-isolation
 ```
+
+## HyENA 테스트
+
+HyENA 전용 테스트 스크립트:
+```
+test_scripts/test_hyena_mainnet.py
+```
+
+필수 환경 변수:
+```
+HYENA_PRIVATE_KEY (또는 HYPERLIQUID_PRIVATE_KEY)
+HYENA_SYMBOL=hyna:LIT
+```
+
+주문 테스트를 하려면:
+```
+HYENA_PLACE_ORDER=1
+HYENA_TEST_USD=10
+```

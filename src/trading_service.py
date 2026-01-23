@@ -150,22 +150,29 @@ class TradingService:
         signal = self.monitor.signals.get(ticker)
 
         if venue == "LGHT":
-            retries = int(getattr(Config, "HEDGE_VERIFY_RETRIES", 2))
+            retries = int(getattr(Config, "HEDGE_VERIFY_RETRIES", 5))
             delay_s = float(getattr(Config, "HEDGE_VERIFY_DELAY_S", 2))
-            for attempt in range(retries + 1):
-                order = await self.lighter.create_order(symbol, OrderType.MARKET, side_enum, qty)
-                self._log_trade(order, venue, reason, signal)
-                if await self._confirm_net_reduction(ticker, pre_net, qty, 2, delay_s):
-                    self.hedge_inflight.pop(ticker, None)
-                    return order
-                if attempt < retries:
-                    logger.warning(f"{ticker} hedge verify failed; retry {attempt + 1}/{retries}")
+            order = await self.lighter.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            self._log_trade(order, venue, reason, signal)
+            if await self._confirm_net_reduction(ticker, pre_net, qty, retries, delay_s):
+                self.hedge_inflight.pop(ticker, None)
+                return order
+            logger.warning(
+                f"{ticker} hedge verify failed after {retries} checks; will wait for next loop"
+            )
             return order
 
         if venue == "VAR" and self.variational:
+            retries = int(getattr(Config, "HEDGE_VERIFY_RETRIES", 5))
+            delay_s = float(getattr(Config, "HEDGE_VERIFY_DELAY_S", 2))
             order = await self.variational.create_order(symbol, OrderType.MARKET, side_enum, qty)
             self._log_trade(order, venue, reason, signal)
-            self.hedge_inflight.pop(ticker, None)
+            if await self._confirm_net_reduction(ticker, pre_net, qty, retries, delay_s):
+                self.hedge_inflight.pop(ticker, None)
+                return order
+            logger.warning(
+                f"{ticker} hedge verify failed after {retries} checks; will wait for next loop"
+            )
             return order
 
         if venue == "GRVT":
@@ -295,13 +302,38 @@ class TradingService:
             orders_by_ticker.setdefault(base, []).append(o)
         return orders_by_ticker
 
-    async def _hedge_grvt_fill(self, ticker: str, hedge_venue: str, hedge_side: OrderSide, qty: float):
+    def _spawn_tick_task(self, tasks: list, coro, label: str):
+        async def _runner():
+            try:
+                return await coro
+            except Exception as e:
+                logger.error(f"Tick task failed ({label}): {e}")
+                return None
+        tasks.append(asyncio.create_task(_runner()))
+
+    async def _hedge_grvt_fill(
+        self,
+        ticker: str,
+        hedge_venue: str,
+        hedge_side: OrderSide,
+        qty: float,
+        tasks: Optional[list] = None,
+    ):
         if qty <= 0:
             return
         pre_net = await self._refresh_net_qty(ticker)
-        await self._execute_hedge_with_verify(
-            ticker, hedge_venue, hedge_side, qty, pre_net, "hedge_fill"
-        )
+        if tasks is None:
+            await self._execute_hedge_with_verify(
+                ticker, hedge_venue, hedge_side, qty, pre_net, "hedge_fill"
+            )
+        else:
+            self._spawn_tick_task(
+                tasks,
+                self._execute_hedge_with_verify(
+                    ticker, hedge_venue, hedge_side, qty, pre_net, "hedge_fill"
+                ),
+                f"hedge_fill:{ticker}",
+            )
 
     async def _close_grvt_partial(self, ticker: str, order_side: OrderSide, qty: float):
         if qty <= 0:
@@ -351,7 +383,7 @@ class TradingService:
             "first_fill_ts": None,
         }
 
-    async def _monitor_grvt_orders(self):
+    async def _monitor_grvt_orders(self, tasks: Optional[list] = None):
         if not self.monitor.tickers:
             return
         open_orders_map = self._grvt_open_orders_map()
@@ -397,7 +429,7 @@ class TradingService:
                 hedge_side = meta.get("hedge_side")
                 if hedge_venue and hedge_side:
                     logger.info(f"-> Hedging {ticker} {hedge_side} {hedge_needed} on {hedge_venue}")
-                    await self._hedge_grvt_fill(ticker, hedge_venue, hedge_side, hedge_needed)
+                    await self._hedge_grvt_fill(ticker, hedge_venue, hedge_side, hedge_needed, tasks)
                     meta["hedged_qty"] = float(meta.get("hedged_qty", 0)) + hedge_needed
 
             last_log = float(meta.get("last_log_ts", 0))
@@ -450,10 +482,11 @@ class TradingService:
         
     async def process_tick(self):
         """Process one trading cycle"""
+        tick_tasks: list = []
         try:
             if not self.is_processing:
                 # 1. Reconcile / Recover State first
-                await self._reconcile_state()
+                await self._reconcile_state(tick_tasks)
                 self._refresh_entry_timestamps()
                 
                 # 2. Process New Entries (if healthy)
@@ -461,6 +494,8 @@ class TradingService:
                 
             # 3. Process Exits (if needed)
             await self._process_exits()
+            if tick_tasks:
+                await asyncio.gather(*tick_tasks)
         except Exception as e:
             logger.error(f"Trading Tick Error: {e}")
 
@@ -672,11 +707,11 @@ class TradingService:
             return 0.0
         return qty
 
-    async def _reconcile_state(self):
+    async def _reconcile_state(self, tasks: Optional[list] = None):
         """
         Check AssetManager for PARTIAL_HEDGE or OPEN_ORDERS states and fix them.
         """
-        await self._monitor_grvt_orders()
+        await self._monitor_grvt_orders(tasks)
         for ticker, pos in self.asset_manager.positions.items():
             state = pos.get('State', 'IDLE')
             
@@ -773,9 +808,18 @@ class TradingService:
                 side_enum = OrderSide.SELL if net_qty > 0 else OrderSide.BUY
                 logger.info(f"   -> Auto-Hedging: {side_enum.value.upper()} {qty} on {venue}")
                 try:
-                    await self._execute_hedge_with_verify(
-                        ticker, venue, side_enum, qty, net_qty, "auto_hedge"
-                    )
+                    if tasks is None:
+                        await self._execute_hedge_with_verify(
+                            ticker, venue, side_enum, qty, net_qty, "auto_hedge"
+                        )
+                    else:
+                        self._spawn_tick_task(
+                            tasks,
+                            self._execute_hedge_with_verify(
+                                ticker, venue, side_enum, qty, net_qty, "auto_hedge"
+                            ),
+                            f"auto_hedge:{ticker}",
+                        )
                     self.recovery_cooldowns[ticker] = time.time() + float(getattr(Config, "HEDGE_RECOVERY_COOLDOWN_S", 20))
                 except Exception as e:
                     logger.error(f"   -> Hedge Recovery Failed: {e}")

@@ -89,6 +89,10 @@ class Config:
     HEDGE_TOLERANCE_RATIO = 0.05 # 5% net tolerance
     HEDGE_MIN_QTY = 0.01 # Minimum absolute qty tolerance
     HEDGE_RECOVERY_COOLDOWN_S = 20 # Cooldown between auto-recovery attempts
+    HEDGE_INFLIGHT_TTL_S = 60 # Block duplicate hedge attempts per ticker
+    HEDGE_NET_STABLE_S = 3 # Require net to be stable before recovery
+    HEDGE_VERIFY_RETRIES = 5 # Hedge verify retries before re-order
+    HEDGE_VERIFY_DELAY_S = 2 # Seconds between verify retries
     ENTRY_MARGIN_BUFFER = 0.05 # Extra buffer when checking available margin
 
     # Strategy/Exit Controls
