@@ -54,6 +54,10 @@ class Dashboard:
             total_all += tot
             
         print(f"{'TOTAL':<10} | {fmt_usd(total_all):<15} | {'-':<15}")
+        if hasattr(self.asset_manager, "session_pnl"):
+            pnl = self.asset_manager.session_pnl()
+            sign = "+" if pnl >= 0 else ""
+            print(f"{'SESSION PNL':<10} | {sign}{fmt_usd(pnl):<15} | {'-':<15}")
         print("-" * 80)
 
     def _print_positions(self):
@@ -66,7 +70,7 @@ class Dashboard:
         if not active_items:
             print("   (No Active Positions)")
         else:
-             # Structure: ticker -> {GRVT: 10, LGHT: -10, State: 'HEDGED', GRVT_OO: 1...}
+             # Structure: ticker -> {GRVT: 10, HYNA: -10, State: 'HEDGED', GRVT_OO: 1...}
              
              for ticker, pdata in active_items.items():
                  state = pdata.get('State', 'UNKNOWN')
@@ -79,7 +83,7 @@ class Dashboard:
                  
                  # Show quantities
                  grvt_qty = pdata.get('GRVT', 0)
-                 lght_qty = pdata.get('LGHT', 0)
+                 lght_qty = pdata.get('HYNA', 0)
                  var_qty = pdata.get('VAR', 0)
                  grvt_oo = pdata.get('GRVT_OO', 0)
                  
@@ -88,7 +92,7 @@ class Dashboard:
                  if state == 'HEDGED':
                      long_venue = None
                      short_venue = None
-                     for venue, qty in (("GRVT", grvt_qty), ("LGHT", lght_qty), ("VAR", var_qty)):
+                     for venue, qty in (("GRVT", grvt_qty), ("HYNA", lght_qty), ("VAR", var_qty)):
                          if qty > 0 and long_venue is None:
                              long_venue = venue
                          if qty < 0 and short_venue is None:
@@ -102,7 +106,7 @@ class Dashboard:
                          l_data = self.monitor.market_data.get(ticker, {}).get(long_venue, {})
                          s_data = self.monitor.market_data.get(ticker, {}).get(short_venue, {})
                          next_times = []
-                         for venue in ("GRVT", "LGHT", "VAR"):
+                         for venue in ("GRVT", "HYNA", "VAR"):
                              vdata = self.monitor.market_data.get(ticker, {}).get(venue, {})
                              if not vdata:
                                  continue
@@ -124,7 +128,7 @@ class Dashboard:
                  
                  print(f"   [{ticker}] {state_display}{fund_str}")
                  if grvt_qty != 0: print(f"      - GRVT: {grvt_qty}")
-                 if lght_qty != 0: print(f"      - LGHT: {lght_qty}")
+                 if lght_qty != 0: print(f"      - HYNA: {lght_qty}")
                  if var_qty != 0:  print(f"      - VAR : {var_qty}")
                  
                  if grvt_oo > 0:
@@ -137,7 +141,7 @@ class Dashboard:
         print("-" * 80)
 
     def _print_market_table(self):
-        print(f"{'TICKER':<6} | {'Status':<15} | {'VAR Yield(Int)':<16} | {'GRVT Yield(Int)':<16} | {'LGHT Yield(Int)':<16}")
+        print(f"{'TICKER':<6} | {'Status':<15} | {'VAR Yield(Int)':<16} | {'GRVT Yield(Int)':<16} | {'HYNA Yield(Int)':<16}")
         print("-" * 90)
         
         tickers = self.monitor.tickers or []
@@ -173,7 +177,7 @@ class Dashboard:
 
             var_str = get_yield_str('VAR')
             grvt_str = get_yield_str('GRVT')
-            lght_str = get_yield_str('LGHT')
+            lght_str = get_yield_str('HYNA')
             
             status = "Monitoring"
             if signal and signal.is_opportunity:

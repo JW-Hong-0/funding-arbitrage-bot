@@ -13,10 +13,10 @@ from asset_manager import AssetManager
 logger = logging.getLogger("TradingService")
 
 class TradingService:
-    def __init__(self, grvt: AbstractExchange, lighter: AbstractExchange, variational: AbstractExchange, 
+    def __init__(self, grvt: AbstractExchange, hyena: AbstractExchange, variational: AbstractExchange, 
                  monitor: MonitoringService, asset_manager: AssetManager, log_manager=None):
         self.grvt = grvt
-        self.lighter = lighter
+        self.hyena = hyena
         self.variational = variational
         self.monitor = monitor
         self.asset_manager = asset_manager
@@ -30,8 +30,20 @@ class TradingService:
         self.is_processing = False
         self.entry_timestamps: Dict[str, float] = {}
         self._entry_skip_reasons: Dict[str, Dict[str, float]] = {}
+        self._recovery_skip_reasons: Dict[str, Dict[str, float]] = {}
         self.hedge_inflight: Dict[str, Dict[str, float]] = {}
+        self.exit_inflight: Dict[str, float] = {}
+        self.exit_grvt_orders: Dict[str, Dict[str, float]] = {}
         self._hedge_net_samples: Dict[str, Dict[str, float]] = {}
+        self._partial_since: Dict[str, float] = {}
+        # Preserve the last selected entry plan per ticker (for hedge venue consistency)
+        self.last_entry_plan: Dict[str, Dict] = {}
+        self.paused: bool = False
+        self.pause_reason: str = ""
+
+    def set_paused(self, paused: bool, reason: str = "") -> None:
+        self.paused = bool(paused)
+        self.pause_reason = reason or ("manual_pause" if paused else "")
 
     def _log_trade(self, order, venue: str, reason: str, signal: Optional[StrategySignal] = None):
         if not self.log_manager or not order:
@@ -71,6 +83,8 @@ class TradingService:
         if not symbol:
             return ""
         s = str(symbol).upper()
+        if ":" in s:
+            s = s.split(":", 1)[1]
         if "_" in s:
             return s.split("_")[0]
         if "-" in s:
@@ -80,9 +94,21 @@ class TradingService:
     def _symbol_for_venue(self, ticker: str, venue: str) -> str:
         if venue == "GRVT":
             return f"{ticker}_USDT_Perp"
-        if venue == "LGHT":
-            return f"{ticker}-USDT"
+        if venue == "HYNA":
+            return self._hyena_symbol(ticker)
         return ticker
+
+    def _hyena_symbol(self, ticker: str) -> str:
+        if not self.hyena:
+            return ticker
+        base = ticker
+        pref = f"{getattr(self.hyena, 'dex_id', 'hyna')}:{base}"
+        if getattr(self.hyena, "markets", None):
+            if pref in self.hyena.markets:
+                return pref
+            if base in self.hyena.markets:
+                return base
+        return pref
 
     def _order_symbol(self, order) -> str:
         if not order:
@@ -103,6 +129,23 @@ class TradingService:
         if time.time() >= info.get("expires", 0):
             self.hedge_inflight.pop(ticker, None)
             return False
+        return True
+
+    def _exit_inflight_active(self, ticker: str) -> bool:
+        expiry = self.exit_inflight.get(ticker)
+        if not expiry:
+            return False
+        return True
+
+    def _is_flat_state(self, ticker: str) -> bool:
+        pos = self.asset_manager.positions.get(ticker, {})
+        if pos.get("GRVT_OO", 0) > 0:
+            return False
+        min_abs = getattr(Config, "HEDGE_MIN_QTY", 0.01)
+        for venue in ("GRVT", "HYNA", "VAR"):
+            qty = float(pos.get(venue, 0.0) or 0.0)
+            if abs(qty) >= min_abs:
+                return False
         return True
 
     async def _refresh_net_qty(self, ticker: str) -> float:
@@ -149,10 +192,24 @@ class TradingService:
         await self._set_leverage_safe(venue, symbol, int(getattr(Config, "TARGET_LEVERAGE", 5)))
         signal = self.monitor.signals.get(ticker)
 
-        if venue == "LGHT":
+        if venue == "HYNA":
             retries = int(getattr(Config, "HEDGE_VERIFY_RETRIES", 5))
             delay_s = float(getattr(Config, "HEDGE_VERIFY_DELAY_S", 2))
-            order = await self.lighter.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            remaining, reason = self._hyena_cooldown_info()
+            if remaining > 0:
+                self.hedge_inflight.pop(ticker, None)
+                detail = reason or f"{remaining:.0f}s"
+                self._log_recovery_skip(ticker, f"hyena_cooldown:{detail}")
+                return None
+            try:
+                order = await self.hyena.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            except Exception:
+                self.hedge_inflight.pop(ticker, None)
+                raise
+            if not order:
+                self.hedge_inflight.pop(ticker, None)
+                logger.error(f"{ticker} hedge order failed on HYNA (None response)")
+                return None
             self._log_trade(order, venue, reason, signal)
             if await self._confirm_net_reduction(ticker, pre_net, qty, retries, delay_s):
                 self.hedge_inflight.pop(ticker, None)
@@ -165,7 +222,15 @@ class TradingService:
         if venue == "VAR" and self.variational:
             retries = int(getattr(Config, "HEDGE_VERIFY_RETRIES", 5))
             delay_s = float(getattr(Config, "HEDGE_VERIFY_DELAY_S", 2))
-            order = await self.variational.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            try:
+                order = await self.variational.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            except Exception:
+                self.hedge_inflight.pop(ticker, None)
+                raise
+            if not order:
+                self.hedge_inflight.pop(ticker, None)
+                logger.error(f"{ticker} hedge order failed on VAR (None response)")
+                return None
             self._log_trade(order, venue, reason, signal)
             if await self._confirm_net_reduction(ticker, pre_net, qty, retries, delay_s):
                 self.hedge_inflight.pop(ticker, None)
@@ -176,7 +241,11 @@ class TradingService:
             return order
 
         if venue == "GRVT":
-            order = await self.grvt.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            try:
+                order = await self.grvt.create_order(symbol, OrderType.MARKET, side_enum, qty)
+            except Exception:
+                self.hedge_inflight.pop(ticker, None)
+                raise
             self._log_trade(order, venue, reason, signal)
             self.hedge_inflight.pop(ticker, None)
             return order
@@ -187,7 +256,7 @@ class TradingService:
         now_ms = int(now_ms or (time.time() * 1000))
         data = self.monitor.market_data.get(ticker, {})
         times = []
-        for venue in ("GRVT", "LGHT", "VAR"):
+        for venue in ("GRVT", "HYNA", "VAR"):
             vdata = data.get(venue)
             if not vdata:
                 continue
@@ -196,17 +265,17 @@ class TradingService:
                 times.append(t)
         return min(times) if times else 0
 
-    def _lighter_cooldown_info(self):
+    def _hyena_cooldown_info(self):
         remaining = 0.0
         reason = ""
-        if hasattr(self.lighter, "_cooldown_remaining"):
+        if hasattr(self.hyena, "_cooldown_remaining"):
             try:
-                remaining = float(self.lighter._cooldown_remaining())
+                remaining = float(self.hyena._cooldown_remaining())
             except Exception:
                 remaining = 0.0
-        if hasattr(self.lighter, "_error_cooldown_reason"):
+        if hasattr(self.hyena, "_error_cooldown_reason"):
             try:
-                reason = str(self.lighter._error_cooldown_reason or "")
+                reason = str(self.hyena._error_cooldown_reason or "")
             except Exception:
                 reason = ""
         return remaining, reason
@@ -233,12 +302,44 @@ class TradingService:
             }
         )
 
+    def _log_recovery_skip(self, ticker: str, reason: str) -> None:
+        if not self.log_manager:
+            return
+        now = time.time()
+        last = self._recovery_skip_reasons.get(ticker, {})
+        last_reason = last.get("reason")
+        last_ts = float(last.get("ts", 0.0))
+        throttle = float(getattr(Config, "RECOVERY_SKIP_LOG_THROTTLE_S", 60))
+        if last_reason == reason and (now - last_ts) < throttle:
+            return
+        self._recovery_skip_reasons[ticker] = {"reason": reason, "ts": now}
+        self.log_manager.log_signal(
+            {
+                "symbol": ticker,
+                "leg_long": "",
+                "leg_short": "",
+                "spread": "",
+                "projected_yield": "",
+                "decision": "skip_recovery",
+                "reason": reason,
+            }
+        )
+
+    def _hyena_ready_for_action(self, ticker: str, context: str) -> bool:
+        remaining, reason = self._hyena_cooldown_info()
+        if remaining <= 0:
+            return True
+        detail = reason or f"{remaining:.0f}s"
+        logger.warning(f"Skip Hyena {context} for {ticker}: cooldown {detail}")
+        self._log_recovery_skip(ticker, f"hyena_cooldown:{context}:{detail}")
+        return False
+
     def _get_max_leverage(self, ticker: str, venue: str) -> float:
         try:
             if venue == "GRVT":
                 m = self.grvt.markets.get(self._symbol_for_venue(ticker, venue))
-            elif venue == "LGHT":
-                m = self.lighter.markets.get(self._symbol_for_venue(ticker, venue))
+            elif venue == "HYNA":
+                m = self.hyena.markets.get(self._hyena_symbol(ticker))
             elif venue == "VAR":
                 m = self.variational.markets.get(ticker) if self.variational else None
             else:
@@ -254,8 +355,8 @@ class TradingService:
         try:
             if venue == "GRVT":
                 await self.grvt.set_leverage(symbol, leverage)
-            elif venue == "LGHT":
-                await self.lighter.set_leverage(symbol, leverage)
+            elif venue == "HYNA":
+                await self.hyena.set_leverage(symbol, leverage)
             elif venue == "VAR" and self.variational:
                 await self.variational.set_leverage(symbol, leverage)
         except Exception as e:
@@ -286,6 +387,21 @@ class TradingService:
             return math.floor(price * inv) / inv
         return math.ceil(price * inv) / inv
 
+    def _compute_grvt_exit_price(
+        self, ticker: str, side: OrderSide, base_price: float, extra_bps: float = 0.0
+    ) -> float:
+        price = self._compute_grvt_maker_price(ticker, side, base_price)
+        if extra_bps > 0:
+            offset = extra_bps / 10000.0
+            if side == OrderSide.SELL:
+                price *= (1 - offset)
+            else:
+                price *= (1 + offset)
+            info = self._market_info(ticker, "GRVT")
+            tick = float(info.get("price_tick") or 0)
+            price = self._round_price_to_tick(price, tick, side)
+        return price
+
     def _grvt_positions_map(self) -> Dict[str, float]:
         positions = {}
         for p in self.asset_manager.raw_positions.get("GRVT", []):
@@ -311,6 +427,29 @@ class TradingService:
                 return None
         tasks.append(asyncio.create_task(_runner()))
 
+    def _get_last_entry_plan(self, ticker: str) -> Optional[Dict]:
+        plan = self.last_entry_plan.get(ticker)
+        if not plan:
+            return None
+        ttl_s = float(getattr(Config, "ENTRY_PLAN_TTL_S", 180))
+        if ttl_s > 0:
+            ts = float(plan.get("ts", 0.0))
+            if ts and (time.time() - ts) > ttl_s:
+                return None
+        return plan
+
+    def _can_hedge_on_venue(self, ticker: str, venue: str, qty: float) -> bool:
+        if qty <= 0:
+            return False
+        data = self.monitor.market_data.get(ticker, {}).get(venue, {})
+        price = float(data.get("price") or 0)
+        if price <= 0:
+            return False
+        lev = min(float(getattr(Config, "TARGET_LEVERAGE", 5)), self._get_max_leverage(ticker, venue))
+        required = self._required_margin_usd(price, qty, lev)
+        avail = float(self.asset_manager.balances.get(venue, {}).get("available", 0.0))
+        return avail >= required
+
     async def _hedge_grvt_fill(
         self,
         ticker: str,
@@ -321,6 +460,26 @@ class TradingService:
     ):
         if qty <= 0:
             return
+        if not self._can_hedge_on_venue(ticker, hedge_venue, qty):
+            logger.warning(f"{ticker} hedge venue {hedge_venue} not viable (balance/size); attempting fallback")
+            if hedge_venue in ("HYNA", "VAR"):
+                alt_venue = "VAR" if hedge_venue == "HYNA" else "HYNA"
+                if (
+                    (alt_venue == "HYNA" and self.hyena)
+                    or (alt_venue == "VAR" and self.variational)
+                ):
+                    if self._can_hedge_on_venue(ticker, alt_venue, qty):
+                        hedge_venue = alt_venue
+                        logger.warning(f"{ticker} hedge venue fallback -> {hedge_venue}")
+                    else:
+                        logger.warning(f"{ticker} hedge fallback {alt_venue} not viable; skipping hedge")
+                        return
+                else:
+                    logger.warning(f"{ticker} hedge fallback {alt_venue} unavailable; skipping hedge")
+                    return
+            else:
+                logger.warning(f"{ticker} hedge venue {hedge_venue} not viable; skipping hedge")
+                return
         pre_net = await self._refresh_net_qty(ticker)
         if tasks is None:
             await self._execute_hedge_with_verify(
@@ -353,6 +512,12 @@ class TradingService:
             logger.warning(f"   -> GRVT partial close failed: {e}")
 
     def _infer_hedge_from_signal(self, ticker: str, order_side: OrderSide) -> Dict[str, Optional[str]]:
+        plan = self._get_last_entry_plan(ticker)
+        if plan and plan.get("hedge_venue"):
+            return {
+                "venue": plan.get("hedge_venue"),
+                "side": plan.get("hedge_side"),
+            }
         signal = self.monitor.signals.get(ticker)
         if signal and ("GRVT" in [signal.best_ask_venue, signal.best_bid_venue]):
             long_venue = signal.best_ask_venue
@@ -361,14 +526,36 @@ class TradingService:
             hedge_side = OrderSide.SELL if long_venue == "GRVT" else OrderSide.BUY
             return {"venue": hedge_venue, "side": hedge_side}
         # Fallback hedge venue
-        hedge_venue = "LGHT" if self.lighter else ("VAR" if self.variational else "GRVT")
+        hedge_venue = "HYNA" if self.hyena else ("VAR" if self.variational else "GRVT")
         hedge_side = OrderSide.SELL if order_side == OrderSide.BUY else OrderSide.BUY
         return {"venue": hedge_venue, "side": hedge_side}
 
-    async def _track_grvt_order(self, ticker: str, order, order_side: OrderSide):
+    def _is_grvt_order_rejected(self, order) -> bool:
+        raw = getattr(order, "raw", None)
+        if not raw or not isinstance(raw, dict):
+            return False
+        if raw.get("error") or raw.get("success") is False:
+            return True
+        code = raw.get("code") or raw.get("errorCode")
+        if code and str(code) not in ("0", "200"):
+            if raw.get("result") is None:
+                return True
+        result = raw.get("result") if isinstance(raw.get("result"), dict) else None
+        status = None
+        if isinstance(result, dict):
+            state = result.get("state")
+            if isinstance(state, dict):
+                status = state.get("status")
+            if not status:
+                status = result.get("status")
+        if status and str(status).upper() in {"REJECTED", "FAILED", "CANCELED", "CANCELLED", "EXPIRED"}:
+            return True
+        return False
+
+    async def _track_grvt_order(self, ticker: str, order, order_side: OrderSide, hedge_override: Optional[Dict] = None):
         positions = self._grvt_positions_map()
         initial_pos = positions.get(ticker, 0.0)
-        hedge_info = self._infer_hedge_from_signal(ticker, order_side)
+        hedge_info = hedge_override or self._infer_hedge_from_signal(ticker, order_side)
         self.active_grvt_orders[ticker] = {
             "order_id": order.id,
             "client_order_id": getattr(order, "client_order_id", None),
@@ -408,6 +595,8 @@ class TradingService:
             open_ids = {str(o.id) for o in open_orders}
             open_ids.update({str(getattr(o, "client_order_id", "")) for o in open_orders})
             order_open = str(meta.get("order_id")) in open_ids or str(meta.get("client_order_id")) in open_ids
+            if order_open and not meta.get("open_seen"):
+                meta["open_seen"] = True
 
             current_pos = pos_map.get(ticker, 0.0)
             delta = current_pos - meta.get("initial_pos", 0.0)
@@ -424,7 +613,11 @@ class TradingService:
             if filled_qty > 0 and not meta.get("first_fill_ts"):
                 meta["first_fill_ts"] = now
             hedge_needed = filled_qty - float(meta.get("hedged_qty", 0))
-            if is_full_fill and hedge_needed >= min_fill:
+            confirm_s = float(getattr(Config, "GRVT_FILL_CONFIRM_S", 3) or 0)
+            if not meta.get("open_seen") and not order_open and age < confirm_s:
+                # Avoid hedging on transient/stale position snapshots right after order placement.
+                pass
+            elif is_full_fill and hedge_needed >= min_fill:
                 hedge_venue = meta.get("hedge_venue")
                 hedge_side = meta.get("hedge_side")
                 if hedge_venue and hedge_side:
@@ -466,6 +659,9 @@ class TradingService:
                         self.active_grvt_orders.pop(ticker, None)
                         continue
 
+            if not order_open and not meta.get("open_seen") and age < confirm_s:
+                # Keep tracking briefly; avoid premature close/cleanup before the order is visible.
+                continue
             if not order_open:
                 # Final hedge if fully filled; otherwise close partial exposure.
                 if is_full_fill and filled_qty > float(meta.get("hedged_qty", 0)) + min_fill:
@@ -479,9 +675,125 @@ class TradingService:
                     await self._close_grvt_partial(ticker, order_side, filled_qty)
                 self.pending_tickers[ticker] = time.time() + 5
                 self.active_grvt_orders.pop(ticker, None)
+
+    async def _monitor_exit_orders(self):
+        if not self.exit_grvt_orders:
+            return
+        open_orders_map = self._grvt_open_orders_map()
+        pos_map = self._grvt_positions_map()
+        now = time.time()
+        reprice_after = float(getattr(Config, "EXIT_REPRICE_AFTER_S", 600))
+        extra_bps = float(getattr(Config, "EXIT_REPRICE_BPS", 0) or 0)
+        min_abs = float(getattr(Config, "HEDGE_MIN_QTY", 0.01))
+
+        for ticker, meta in list(self.exit_grvt_orders.items()):
+            grvt_sym = f"{ticker}_USDT_Perp"
+            open_orders = open_orders_map.get(ticker, [])
+            open_ids = {str(o.id) for o in open_orders}
+            open_ids.update({str(getattr(o, "client_order_id", "")) for o in open_orders})
+            is_open = str(meta.get("order_id")) in open_ids or str(meta.get("client_order_id")) in open_ids
+            age = now - float(meta.get("created_ts", now))
+
+            if is_open and reprice_after > 0 and age >= reprice_after:
+                try:
+                    await self.grvt.cancel_order(meta.get("order_id"), grvt_sym)
+                except Exception:
+                    pass
+                base_price = float(self.monitor.market_data.get(ticker, {}).get("GRVT", {}).get("price") or 0)
+                if base_price <= 0:
+                    continue
+                side = meta.get("side")
+                price = self._compute_grvt_exit_price(ticker, side, base_price, extra_bps)
+                order = await self.grvt.create_order(
+                    grvt_sym,
+                    OrderType.LIMIT,
+                    side,
+                    float(meta.get("size", 0)),
+                    price,
+                    params={"reduce_only": True},
+                )
+                self._log_trade(order, "GRVT", "exit_reprice")
+                meta["order_id"] = order.id
+                meta["client_order_id"] = getattr(order, "client_order_id", None)
+                meta["created_ts"] = now
+                meta["reprice_count"] = int(meta.get("reprice_count", 0)) + 1
+                continue
+
+            if is_open:
+                continue
+
+            current_size = float(pos_map.get(ticker, 0.0))
+            if abs(current_size) > min_abs:
+                base_price = float(self.monitor.market_data.get(ticker, {}).get("GRVT", {}).get("price") or 0)
+                if base_price <= 0:
+                    continue
+                side = meta.get("side")
+                price = self._compute_grvt_exit_price(ticker, side, base_price, extra_bps if age >= reprice_after else 0.0)
+                order = await self.grvt.create_order(
+                    grvt_sym,
+                    OrderType.LIMIT,
+                    side,
+                    float(meta.get("size", 0)),
+                    price,
+                    params={"reduce_only": True},
+                )
+                self._log_trade(order, "GRVT", "exit_replace")
+                meta["order_id"] = order.id
+                meta["client_order_id"] = getattr(order, "client_order_id", None)
+                meta["created_ts"] = now
+                continue
+
+            # GRVT flat -> close remaining hedge legs (use live positions, not cached sizes)
+            live_pos = self.asset_manager.positions.get(ticker, {})
+            lght_size = float(live_pos.get("HYNA", 0.0))
+            var_size = float(live_pos.get("VAR", 0.0))
+            hedge_done = True
+            retry_reasons = []
+
+            if abs(lght_size) > min_abs and self.hyena:
+                if not self._hyena_ready_for_action(ticker, "exit_hedge"):
+                    hedge_done = False
+                    retry_reasons.append("hyena_cooldown")
+                else:
+                    h_side = OrderSide.BUY if lght_size < 0 else OrderSide.SELL
+                    sym = f"{ticker}-USDT"
+                    try:
+                        order = await self.hyena.create_order(sym, OrderType.MARKET, h_side, abs(lght_size))
+                        self._log_trade(order, "HYNA", "exit_hedge")
+                    except Exception as e:
+                        hedge_done = False
+                        retry_reasons.append(f"hyena_error:{e}")
+                        logger.error("Exit hedge failed (HYNA) %s %s qty=%s err=%s", ticker, h_side, abs(lght_size), e)
+
+            if abs(var_size) > min_abs and self.variational:
+                h_side = OrderSide.BUY if var_size < 0 else OrderSide.SELL
+                try:
+                    order = await self.variational.create_order(ticker, OrderType.MARKET, h_side, abs(var_size))
+                    self._log_trade(order, "VAR", "exit_hedge")
+                except Exception as e:
+                    hedge_done = False
+                    retry_reasons.append(f"variational_error:{e}")
+                    logger.error("Exit hedge failed (VAR) %s %s qty=%s err=%s", ticker, h_side, abs(var_size), e)
+
+            if not hedge_done:
+                meta["hedge_retry_count"] = int(meta.get("hedge_retry_count", 0)) + 1
+                meta["hedge_retry_ts"] = time.time()
+                meta["hedge_retry_reason"] = ",".join(retry_reasons) if retry_reasons else "unknown"
+                logger.warning(
+                    "%s exit hedge pending; will retry. retry_count=%s reason=%s",
+                    ticker,
+                    meta.get("hedge_retry_count", 0),
+                    meta.get("hedge_retry_reason", ""),
+                )
+                continue
+            self.exit_grvt_orders.pop(ticker, None)
+            cooldown = float(getattr(Config, "EXIT_COMPLETE_COOLDOWN_S", 90))
+            self.exit_cooldowns[ticker] = time.time() + cooldown
         
     async def process_tick(self):
         """Process one trading cycle"""
+        if self.paused:
+            return
         tick_tasks: list = []
         try:
             if not self.is_processing:
@@ -514,9 +826,59 @@ class TradingService:
         buffer = float(getattr(Config, "ENTRY_MARGIN_BUFFER", 0.05))
         return (price * qty) / lev * (1 + buffer)
 
+    def _order_error_text(self, err) -> str:
+        if isinstance(err, dict):
+            parts = []
+            for key in ("message", "error", "reason", "detail"):
+                val = err.get(key)
+                if val:
+                    parts.append(str(val))
+            code = err.get("code") or err.get("errorCode")
+            if code:
+                parts.append(f"code={code}")
+            return " ".join(parts) if parts else str(err)
+        return str(err)
+
+    def _classify_order_error(self, err) -> str:
+        text = self._order_error_text(err).lower()
+        if any(k in text for k in ("insufficient", "insuff", "margin", "balance", "not enough", "collateral")):
+            return "insufficient_margin"
+        if any(k in text for k in ("401", "unauthorized", "auth", "token", "signature")):
+            return "auth"
+        if any(k in text for k in ("nonce", "sequence", "invalid nonce")):
+            return "nonce"
+        if any(k in text for k in ("429", "rate limit", "too many requests")):
+            return "rate_limit"
+        if any(k in text for k in ("timeout", "timed out", "connection", "network")):
+            return "network"
+        return "unknown"
+
+    def _entry_failure_cooldown_s(self, err) -> float:
+        reason = self._classify_order_error(err)
+        if reason == "insufficient_margin":
+            return float(getattr(Config, "ENTRY_FAIL_COOLDOWN_INSUFFICIENT_S", 120) or 120)
+        if reason == "auth":
+            return float(getattr(Config, "ENTRY_FAIL_COOLDOWN_AUTH_S", 30) or 30)
+        if reason == "rate_limit":
+            return float(getattr(Config, "ENTRY_FAIL_COOLDOWN_RATE_S", 30) or 30)
+        if reason == "nonce":
+            return float(getattr(Config, "ENTRY_FAIL_COOLDOWN_NONCE_S", 30) or 30)
+        if reason == "network":
+            return float(getattr(Config, "ENTRY_FAIL_COOLDOWN_NETWORK_S", 10) or 10)
+        return float(getattr(Config, "ENTRY_FAIL_COOLDOWN_UNKNOWN_S", 30) or 30)
+
+    def _apply_entry_failure_cooldown(self, ticker: str, venue: str, err, context: str) -> None:
+        reason = self._classify_order_error(err)
+        cooldown = self._entry_failure_cooldown_s(err)
+        detail = self._order_error_text(err)
+        self.pending_tickers[ticker] = time.time() + cooldown
+        logger.warning(
+            f"Entry failure cooldown {ticker} venue={venue} reason={reason} cooldown={cooldown:.0f}s context={context} detail={detail}"
+        )
+
     def _rank_entry_pairs(self, ticker: str) -> list:
         data = self.monitor.market_data.get(ticker, {})
-        venues = [v for v in ("GRVT", "LGHT", "VAR") if data.get(v) and data[v].get("price", 0) > 0]
+        venues = [v for v in ("GRVT", "HYNA", "VAR") if data.get(v) and data[v].get("price", 0) > 0]
         if len(venues) < 2:
             return []
         ranked = []
@@ -647,8 +1009,8 @@ class TradingService:
         ex = None
         if venue == "GRVT":
             ex = self.grvt
-        elif venue == "LGHT":
-            ex = self.lighter
+        elif venue == "HYNA":
+            ex = self.hyena
         elif venue == "VAR":
             ex = self.variational
         if not ex:
@@ -712,12 +1074,77 @@ class TradingService:
         Check AssetManager for PARTIAL_HEDGE or OPEN_ORDERS states and fix them.
         """
         await self._monitor_grvt_orders(tasks)
+        await self._monitor_exit_orders()
+        # Clear exit-inflight when flat or TTL expired
+        for ticker in list(self.exit_inflight.keys()):
+            if self._is_flat_state(ticker):
+                self.exit_inflight.pop(ticker, None)
+            else:
+                ttl = float(getattr(Config, "EXIT_INFLIGHT_TTL_S", 180))
+                expiry = self.exit_inflight.get(ticker, 0) or 0
+                if ttl > 0 and time.time() >= expiry:
+                    logger.warning(
+                        f"{ticker} exit inflight TTL exceeded; waiting for flat before re-entry"
+                    )
+                    # keep blocking re-entry until flat
         for ticker, pos in self.asset_manager.positions.items():
             state = pos.get('State', 'IDLE')
+            if state != 'PARTIAL_HEDGE':
+                self._partial_since.pop(ticker, None)
             
             # CASE 1: PARTIAL HEDGE (Qty Mismatch) -> Auto Hedge
             if state == 'PARTIAL_HEDGE':
-                if ticker in self.active_grvt_orders or ticker in self.pending_tickers:
+                now = time.time()
+                if ticker not in self._partial_since:
+                    self._partial_since[ticker] = now
+                else:
+                    watchdog_s = float(getattr(Config, "PARTIAL_WATCHDOG_S", 0))
+                    age = now - float(self._partial_since.get(ticker, now))
+                    if watchdog_s > 0 and age >= watchdog_s:
+                        cleared = []
+                        if self._hedge_inflight_active(ticker):
+                            self.hedge_inflight.pop(ticker, None)
+                            cleared.append("hedge_inflight")
+                        if getattr(Config, "PARTIAL_WATCHDOG_CLEAR_RECOVERY_COOLDOWN", True):
+                            if ticker in self.recovery_cooldowns:
+                                self.recovery_cooldowns.pop(ticker, None)
+                                cleared.append("recovery_cooldown")
+                        if getattr(Config, "PARTIAL_WATCHDOG_CLEAR_PENDING", True):
+                            if ticker in self.pending_tickers:
+                                self.pending_tickers.pop(ticker, None)
+                                cleared.append("pending_ticker")
+                        if getattr(Config, "PARTIAL_WATCHDOG_CLEAR_EXIT", True):
+                            expiry = self.exit_inflight.get(ticker)
+                            if expiry and time.time() >= expiry:
+                                self.exit_inflight.pop(ticker, None)
+                                cleared.append("exit_inflight")
+                        if cleared:
+                            logger.warning(
+                                f"{ticker} partial hedge watchdog cleared {','.join(cleared)} after {age:.0f}s"
+                            )
+                            self._partial_since[ticker] = now
+                if self._exit_inflight_active(ticker):
+                    # Avoid compounding during exit; wait for flat or TTL expiry
+                    self._log_recovery_skip(ticker, "exit_inflight")
+                    continue
+                exit_cd = self.exit_cooldowns.get(ticker, 0)
+                if exit_cd and time.time() < exit_cd:
+                    remaining = exit_cd - time.time()
+                    self._log_recovery_skip(ticker, f"exit_cooldown:{remaining:.0f}s")
+                    continue
+                if ticker in self.active_grvt_orders:
+                    # If GRVT maker is pending, never hedge on other venues until it's visible.
+                    meta = self.active_grvt_orders.get(ticker)
+                    confirm_s = float(getattr(Config, "GRVT_FILL_CONFIRM_S", 3) or 0)
+                    age = time.time() - float(meta.get("created_ts", time.time())) if meta else 0.0
+                    if meta and not meta.get("open_seen") and age < confirm_s:
+                        self._log_recovery_skip(ticker, f"grvt_open_pending:{max(0.0, confirm_s - age):.1f}s")
+                        continue
+                    self._log_recovery_skip(ticker, "grvt_order_active")
+                    continue
+                if ticker in self.pending_tickers:
+                    remaining = self.pending_tickers.get(ticker, 0) - time.time()
+                    self._log_recovery_skip(ticker, f"pending:{max(0.0, remaining):.0f}s")
                     continue
                 net_qty = pos.get('Net_Qty', 0)
                 # If negative net (Short Heavy), we need to BUY on the 'Deficit' venue?
@@ -729,57 +1156,96 @@ class TradingService:
                 # If Net > 0 (Long Heavy), we need to SELL 'Net' amount.
                 # Where? On the venue that is 'Light'? Or the one that is 'Heavy'?
                 # AssetManager doesn't say which is heavy easily without logic.
-                # Let's use generic "Hedge on Lighter/Variational" if GRVT is the heavy one.
+                # Let's use generic "Hedge on Hyena/Variational" if GRVT is the heavy one.
                 
                 logger.warning(f"🚨 {ticker} Partial Hedge Detected (Net: {net_qty}). Recovery Protocol Initiated.")
 
-                now = time.time()
                 sample = self._hedge_net_samples.get(ticker)
                 if not sample or abs(sample.get("net", 0) - net_qty) > 1e-9:
                     self._hedge_net_samples[ticker] = {"net": net_qty, "ts": now}
+                    self._log_recovery_skip(ticker, "net_sample_reset")
                     continue
                 stable_s = float(getattr(Config, "HEDGE_NET_STABLE_S", 3))
                 if now - sample.get("ts", now) < stable_s:
+                    remain = stable_s - (now - sample.get("ts", now))
+                    self._log_recovery_skip(ticker, f"net_unstable:{max(0.0, remain):.1f}s")
                     continue
 
                 if self._hedge_inflight_active(ticker):
+                    self._log_recovery_skip(ticker, "hedge_inflight")
                     continue
                 
                 # Determine which venue to trade to neutralize 'net_qty'
-                # If Net > 0 (Too Long), Sell on Taker Venue (Lighter/Var).
+                # If Net > 0 (Too Long), Sell on Taker Venue (Hyena/Var).
                 # If Net < 0 (Too Short), Buy on Taker Venue.
                 
                 side = 'sell' if net_qty > 0 else 'buy'
                 abs_qty = abs(net_qty)
-                
+
                 # Where to execute? 
                 # Check where we have existing positions.
-                # If GRVT has position, maybe hedge on LGHT/VAR.
-                # Default to LGHT for now or check signals?
+                # If GRVT has position, maybe hedge on HYNA/VAR.
+                # Default to HYNA for now or check signals?
                 # Safety: Just Log for now? Or execute?
-                # User complaint: AVNT GRVT 180, LGHT 290. Net -110 (Short Heavy, assuming short is negative).
+                # User complaint: AVNT GRVT 180, HYNA 290. Net -110 (Short Heavy, assuming short is negative).
                 # We need to BUY 110.
-                # If we buy on LGHT, we close short. If we buy on GRVT, we open long.
+                # If we buy on HYNA, we close short. If we buy on GRVT, we open long.
                 # Ideally close the excess.
                 
                 cooldown_until = self.recovery_cooldowns.get(ticker, 0)
                 if time.time() < cooldown_until:
+                    remaining = cooldown_until - time.time()
+                    self._log_recovery_skip(ticker, f"recovery_cooldown:{remaining:.0f}s")
                     continue
 
                 positions = {
                     "GRVT": pos.get("GRVT", 0.0),
-                    "LGHT": pos.get("LGHT", 0.0),
+                    "HYNA": pos.get("HYNA", 0.0),
                     "VAR": pos.get("VAR", 0.0),
                 }
-                candidates = {k: v for k, v in positions.items() if (v > 0 and net_qty > 0) or (v < 0 and net_qty < 0)}
-                if not candidates:
-                    continue
 
-                venue = max(candidates.items(), key=lambda x: abs(x[1]))[0]
-                qty = min(abs_qty, abs(positions[venue]))
-                qty = await self._adjust_qty_to_rules(ticker, venue, qty)
-                if qty <= 0:
-                    logger.warning(f"   -> Auto-Hedging skipped (min qty) {ticker} {venue}")
+                # Prefer the last entry plan's hedge venue for consistency (especially on fallback pairs).
+                preferred = self._get_last_entry_plan(ticker)
+                venue = None
+                qty = 0.0
+                if preferred and preferred.get("hedge_venue") in ("HYNA", "VAR"):
+                    pref_venue = preferred.get("hedge_venue")
+                    pref_qty = await self._adjust_qty_to_rules(ticker, pref_venue, abs_qty)
+                    if pref_qty > 0 and self._can_hedge_on_venue(ticker, pref_venue, pref_qty):
+                        venue = pref_venue
+                        qty = pref_qty
+                    else:
+                        logger.warning(
+                            f"   -> Preferred hedge {pref_venue} not viable (qty/balance)."
+                        )
+                        # Try the other taker venue if available
+                        alt_venue = "VAR" if pref_venue == "HYNA" else "HYNA"
+                        alt_qty = await self._adjust_qty_to_rules(ticker, alt_venue, abs_qty)
+                        if alt_qty > 0 and self._can_hedge_on_venue(ticker, alt_venue, alt_qty):
+                            venue = alt_venue
+                            qty = alt_qty
+
+                if not venue:
+                    candidates = {
+                        k: v
+                        for k, v in positions.items()
+                        if (v > 0 and net_qty > 0) or (v < 0 and net_qty < 0)
+                    }
+                    if not candidates:
+                        self._log_recovery_skip(ticker, "no_candidate_venue")
+                        continue
+
+                    # Prefer the largest exposure, but only if balance/margin allows.
+                    for cand, pos_qty in sorted(candidates.items(), key=lambda x: abs(x[1]), reverse=True):
+                        cand_qty = await self._adjust_qty_to_rules(ticker, cand, min(abs_qty, abs(pos_qty)))
+                        if cand_qty > 0 and self._can_hedge_on_venue(ticker, cand, cand_qty):
+                            venue = cand
+                            qty = cand_qty
+                            break
+
+                if not venue or qty <= 0:
+                    logger.warning(f"   -> Auto-Hedging skipped (no viable venue) {ticker}")
+                    self._log_recovery_skip(ticker, "no_viable_venue")
                     # Fallback: reduce GRVT position if it contributes to the net imbalance.
                     grvt_pos = positions.get("GRVT", 0.0)
                     if (net_qty > 0 and grvt_pos > 0) or (net_qty < 0 and grvt_pos < 0):
@@ -838,6 +1304,10 @@ class TradingService:
                     if getattr(Config, "STRATEGY_REBALANCE_DEBUG", False):
                         logger.info(f"Skip {ticker} entry/rebalance: funding event window")
                     continue
+                if not self._is_decision_window(ticker):
+                    if getattr(Config, "FUNDING_DECISION_LOG", False):
+                        self._log_entry_skip(ticker, signal, "before_decision_window")
+                    continue
                 # Check Pending Lock
                 if ticker in self.pending_tickers:
                     remaining = self.pending_tickers.get(ticker, 0) - now
@@ -846,6 +1316,9 @@ class TradingService:
                     if exit_cd and exit_cd > now:
                         reason = "exit_cooldown"
                     self._log_entry_skip(ticker, signal, f"{reason}:{max(0.0, remaining):.0f}s")
+                    continue
+                if self._exit_inflight_active(ticker) and not self._is_flat_state(ticker):
+                    self._log_entry_skip(ticker, signal, "exit_inflight")
                     continue
                 if ticker in self.active_grvt_orders:
                     continue
@@ -869,11 +1342,11 @@ class TradingService:
                     logger.info(f"Skipping {ticker} entry: existing position detected.")
                     continue
 
-                if "LGHT" in (signal.best_ask_venue, signal.best_bid_venue):
-                    remaining, reason = self._lighter_cooldown_info()
+                if "HYNA" in (signal.best_ask_venue, signal.best_bid_venue):
+                    remaining, reason = self._hyena_cooldown_info()
                     if remaining > 0:
                         detail = reason or "cooldown_active"
-                        self._log_entry_skip(ticker, signal, f"lighter_cooldown:{detail}")
+                        self._log_entry_skip(ticker, signal, f"hyena_cooldown:{detail}")
                         self.pending_tickers[ticker] = now + min(remaining, 30)
                         continue
                 
@@ -882,7 +1355,7 @@ class TradingService:
     def _has_active_position(self, ticker: str) -> bool:
         pos = self.asset_manager.positions.get(ticker, {})
         min_abs = getattr(Config, "HEDGE_MIN_QTY", 0.01)
-        for venue in ("GRVT", "LGHT", "VAR"):
+        for venue in ("GRVT", "HYNA", "VAR"):
             qty = float(pos.get(venue, 0.0) or 0.0)
             if abs(qty) >= min_abs:
                 return True
@@ -895,7 +1368,7 @@ class TradingService:
         data = self.monitor.market_data.get(ticker, {})
         now_ms = int(time.time() * 1000)
         closest = None
-        for venue in ("GRVT", "LGHT", "VAR"):
+        for venue in ("GRVT", "HYNA", "VAR"):
             ex_data = data.get(venue) or {}
             nft = int(ex_data.get("next_funding_time") or 0)
             if nft <= 0:
@@ -905,10 +1378,35 @@ class TradingService:
                 closest = delta
         return closest is not None and closest <= window_ms
 
+    def _next_funding_event_ms(self, ticker: str) -> int:
+        data = self.monitor.market_data.get(ticker, {})
+        now_ms = int(time.time() * 1000)
+        next_ms = None
+        for venue in ("GRVT", "HYNA", "VAR"):
+            ex_data = data.get(venue) or {}
+            nft = int(ex_data.get("next_funding_time") or 0)
+            if nft <= 0:
+                continue
+            if nft < now_ms:
+                continue
+            if next_ms is None or nft < next_ms:
+                next_ms = nft
+        return int(next_ms or 0)
+
+    def _is_decision_window(self, ticker: str) -> bool:
+        lead_s = float(getattr(Config, "FUNDING_DECISION_LEAD_S", 0) or 0)
+        if lead_s <= 0:
+            return True
+        nft = self._next_funding_event_ms(ticker)
+        if nft <= 0:
+            return True
+        now_ms = int(time.time() * 1000)
+        return now_ms >= (nft - int(lead_s * 1000))
+
     def _current_hedge_pair(self, pos_struct: Dict[str, float]) -> Optional[Dict[str, str]]:
         min_abs = getattr(Config, "HEDGE_MIN_QTY", 0.01)
         venues = []
-        for venue in ("GRVT", "LGHT", "VAR"):
+        for venue in ("GRVT", "HYNA", "VAR"):
             qty = float(pos_struct.get(venue, 0.0) or 0.0)
             if abs(qty) >= min_abs:
                 venues.append((venue, qty))
@@ -937,6 +1435,10 @@ class TradingService:
         if self._is_funding_freeze_window(ticker):
             if getattr(Config, "STRATEGY_REBALANCE_LOG_REASONS", False):
                 logger.info(f"Skip {ticker} rebalance: funding event window")
+            return False
+        if not self._is_decision_window(ticker):
+            if getattr(Config, "STRATEGY_REBALANCE_LOG_REASONS", False):
+                logger.info(f"Skip {ticker} rebalance: before decision window")
             return False
         current = self._current_hedge_pair(pos_struct)
         if not current:
@@ -1049,6 +1551,8 @@ class TradingService:
                     continue
                 if ticker in self.pending_tickers:
                     continue
+                if self._exit_inflight_active(ticker):
+                    continue
                 cooldown_until = self.exit_cooldowns.get(ticker, 0)
                 if cooldown_until and now < cooldown_until:
                     if getattr(Config, "EXIT_LOG_REASONS", False):
@@ -1056,7 +1560,7 @@ class TradingService:
                         logger.info(f"Skip {ticker} exit: cooldown {remaining:.0f}s")
                     continue
 
-                venues = [v for v in ["GRVT", "LGHT", "VAR"] if abs(pos.get(v, 0)) > 0]
+                venues = [v for v in ["GRVT", "HYNA", "VAR"] if abs(pos.get(v, 0)) > 0]
                 if len(venues) < 2:
                     continue
                 if len(venues) > 2:
@@ -1112,166 +1616,202 @@ class TradingService:
     async def execute_entry(self, signal: StrategySignal):
         """
         Execute Arbitrage Entry.
-        Refacted to support Maker-Taker (GRVT) and Taker-Taker (VAR-LGHT).
+        Refacted to support Maker-Taker (GRVT) and Taker-Taker (VAR-HYNA).
         """
         self.is_processing = True
         logger.info(f"⚡ Executing Entry: {signal}")
         
         try:
-             grvt_sym = f"{signal.ticker}_USDT_Perp"
-             open_orders = await self.grvt.fetch_open_orders(grvt_sym)
-             existing_order = None
+            grvt_sym = f"{signal.ticker}_USDT_Perp"
+            open_orders = await self.grvt.fetch_open_orders(grvt_sym)
+            existing_order = None
 
-             long_venue = signal.best_ask_venue
-             short_venue = signal.best_bid_venue
-             plan = await self._prepare_entry(signal.ticker, long_venue, short_venue)
-             if not plan and getattr(Config, "ENABLE_FALLBACK_ENTRY", True):
-                 attempts = 0
-                 for cand in self._rank_entry_pairs(signal.ticker):
-                     if not cand.get("is_opportunity"):
-                         continue
-                     if cand["long"] == long_venue and cand["short"] == short_venue:
-                         continue
-                     plan = await self._prepare_entry(signal.ticker, cand["long"], cand["short"])
-                     if plan:
-                         logger.warning(
-                             f"⚠️ Fallback entry {signal.ticker}: "
-                             f"{long_venue}/{short_venue} -> {cand['long']}/{cand['short']}"
-                         )
-                         break
-                     attempts += 1
-                     if attempts >= int(getattr(Config, "FALLBACK_MAX_ATTEMPTS", 3) or 3):
-                         break
-             if not plan:
-                 logger.warning(f"Entry skipped {signal.ticker}: no viable pair (balances/size).")
-                 return
+            long_venue = signal.best_ask_venue
+            short_venue = signal.best_bid_venue
+            plan = await self._prepare_entry(signal.ticker, long_venue, short_venue)
+            if not plan and getattr(Config, "ENABLE_FALLBACK_ENTRY", True):
+                attempts = 0
+                for cand in self._rank_entry_pairs(signal.ticker):
+                    if not cand.get("is_opportunity"):
+                        continue
+                    if cand["long"] == long_venue and cand["short"] == short_venue:
+                        continue
+                    plan = await self._prepare_entry(signal.ticker, cand["long"], cand["short"])
+                    if plan:
+                        logger.warning(
+                            f"⚠️ Fallback entry {signal.ticker}: "
+                            f"{long_venue}/{short_venue} -> {cand['long']}/{cand['short']}"
+                        )
+                        break
+                    attempts += 1
+                    if attempts >= int(getattr(Config, "FALLBACK_MAX_ATTEMPTS", 3) or 3):
+                        break
+            if not plan:
+                logger.warning(f"Entry skipped {signal.ticker}: no viable pair (balances/size).")
+                return
 
-             long_venue = plan["long_venue"]
-             short_venue = plan["short_venue"]
-             is_grvt_maker = plan["is_grvt_maker"]
-             exec_signal = signal
-             if long_venue != signal.best_ask_venue or short_venue != signal.best_bid_venue:
-                 exec_signal = StrategySignal(
-                     signal.ticker,
-                     long_venue,
-                     short_venue,
-                     plan.get("entry_spread_pct", signal.spread),
-                     plan.get("projected_yield", signal.projected_yield),
-                 )
+            long_venue = plan["long_venue"]
+            short_venue = plan["short_venue"]
+            is_grvt_maker = plan["is_grvt_maker"]
+            exec_signal = signal
+            if long_venue != signal.best_ask_venue or short_venue != signal.best_bid_venue:
+                exec_signal = StrategySignal(
+                    signal.ticker,
+                    long_venue,
+                    short_venue,
+                    plan.get("entry_spread_pct", signal.spread),
+                    plan.get("projected_yield", signal.projected_yield),
+                )
 
-             target_side = None
-             if is_grvt_maker:
-                 target_side = plan["target_side"]
+            target_side = None
+            hedge_side = None
+            if is_grvt_maker:
+                target_side = plan["target_side"]
+                hedge_side = OrderSide.SELL if target_side == OrderSide.BUY else OrderSide.BUY
+            # Track the selected entry plan to keep hedge venue consistent (including fallback pairs)
+            entry_plan = {
+                "long_venue": long_venue,
+                "short_venue": short_venue,
+                "ts": time.time(),
+            }
+            if is_grvt_maker:
+                entry_plan.update(
+                    {
+                        "hedge_venue": plan.get("hedge_venue"),
+                        "hedge_side": hedge_side,
+                    }
+                )
+            self.last_entry_plan[signal.ticker] = entry_plan
 
-             if open_orders:
-                 if is_grvt_maker:
-                     min_hold = float(getattr(Config, "GRVT_ORDER_MIN_HOLD_S", 45))
-                     now = time.time()
-                     for o in open_orders:
-                         if o.side != target_side:
-                             create_ts = getattr(o, "timestamp", None)
-                             raw = getattr(o, "raw", {}) or {}
-                             raw_meta = raw.get("metadata", {}) if isinstance(raw, dict) else {}
-                             if raw_meta.get("create_time"):
-                                 try:
-                                     create_ts = int(raw_meta["create_time"]) / 1_000_000_000
-                                 except (ValueError, TypeError):
-                                     create_ts = None
-                             if create_ts and (now - float(create_ts)) < min_hold:
-                                 logger.warning(
-                                     f"⚠️ Mismatched GRVT order {o.id} detected but within hold window; skip cancel."
-                                 )
-                                 continue
-                             logger.warning(f"⚠️ Found mismatched GRVT order {o.id} (Side: {o.side}). Cancelling.")
-                             await self.grvt.cancel_order(o.id, grvt_sym)
-                     for o in open_orders:
-                         if o.side == target_side:
-                             existing_order = o
-                             logger.info(f"♻️ Found existing open order for {signal.ticker}: {o.id}. Adopting.")
-                             break
-                     if existing_order:
-                         await self._track_grvt_order(signal.ticker, existing_order, target_side)
-                         self.pending_tickers[signal.ticker] = time.time() + 5
-                         return
-                 else:
-                     order = open_orders[0]
-                     logger.warning(f"⚠️ GRVT order exists but strategy is {long_venue}/{short_venue}. Holding order {order.id}.")
-                     await self._track_grvt_order(signal.ticker, order, order.side)
-                     self.pending_tickers[signal.ticker] = time.time() + 5
-                     return
+            if open_orders:
+                if is_grvt_maker:
+                    min_hold = float(getattr(Config, "GRVT_ORDER_MIN_HOLD_S", 45))
+                    now = time.time()
+                    for o in open_orders:
+                        if o.side != target_side:
+                            create_ts = getattr(o, "timestamp", None)
+                            raw = getattr(o, "raw", {}) or {}
+                            raw_meta = raw.get("metadata", {}) if isinstance(raw, dict) else {}
+                            if raw_meta.get("create_time"):
+                                try:
+                                    create_ts = int(raw_meta["create_time"]) / 1_000_000_000
+                                except (ValueError, TypeError):
+                                    create_ts = None
+                            if create_ts and (now - float(create_ts)) < min_hold:
+                                logger.warning(
+                                    f"⚠️ Mismatched GRVT order {o.id} detected but within hold window; skip cancel."
+                                )
+                                continue
+                            logger.warning(f"⚠️ Found mismatched GRVT order {o.id} (Side: {o.side}). Cancelling.")
+                            await self.grvt.cancel_order(o.id, grvt_sym)
+                    for o in open_orders:
+                        if o.side == target_side:
+                            existing_order = o
+                            logger.info(f"♻️ Found existing open order for {signal.ticker}: {o.id}. Adopting.")
+                            break
+                    if existing_order:
+                            hedge_override = None
+                            if hedge_side and plan.get("hedge_venue"):
+                                hedge_override = {"venue": plan.get("hedge_venue"), "side": hedge_side}
+                            await self._track_grvt_order(signal.ticker, existing_order, target_side, hedge_override)
+                            self.pending_tickers[signal.ticker] = time.time() + 5
+                            return
+                else:
+                    order = open_orders[0]
+                    logger.warning(f"⚠️ GRVT order exists but strategy is {long_venue}/{short_venue}. Holding order {order.id}.")
+                    await self._track_grvt_order(signal.ticker, order, order.side)
+                    self.pending_tickers[signal.ticker] = time.time() + 5
+                    return
 
-             if not is_grvt_maker:
-                 logger.info(f"🚀 Taker-Taker Strategy Detected: {long_venue} Long / {short_venue} Short")
-                 size = plan["size"]
-                 sym_long = plan["sym_long"]
-                 sym_short = plan["sym_short"]
-                 lev_long_used = plan["lev_long"]
-                 lev_short_used = plan["lev_short"]
+            if not is_grvt_maker:
+                logger.info(f"🚀 Taker-Taker Strategy Detected: {long_venue} Long / {short_venue} Short")
+                if "HYNA" in (long_venue, short_venue):
+                    if not self._hyena_ready_for_action(signal.ticker, "entry_taker"):
+                        self.pending_tickers[signal.ticker] = time.time() + 30
+                        return
+                size = plan["size"]
+                sym_long = plan["sym_long"]
+                sym_short = plan["sym_short"]
+                lev_long_used = plan["lev_long"]
+                lev_short_used = plan["lev_short"]
 
-                 logger.info(f"   ⚖️ Taker Size: {size}")
-                 await self._set_leverage_safe(long_venue, sym_long, int(lev_long_used))
-                 await self._set_leverage_safe(short_venue, sym_short, int(lev_short_used))
+                logger.info(f"   ⚖️ Taker Size: {size}")
+                await self._set_leverage_safe(long_venue, sym_long, int(lev_long_used))
+                await self._set_leverage_safe(short_venue, sym_short, int(lev_short_used))
 
-                 logger.info(f"-> Executing Leg 1: Buy {size} on {long_venue}")
-                 o1 = None
-                 try:
-                     if long_venue == 'LGHT':
-                         o1 = await self.lighter.create_order(sym_long, OrderType.MARKET, OrderSide.BUY, size)
-                     elif long_venue == 'VAR':
-                         o1 = await self.variational.create_order(sym_long, OrderType.MARKET, OrderSide.BUY, size)
-                     elif long_venue == 'GRVT':
-                         o1 = await self.grvt.create_order(sym_long, OrderType.MARKET, OrderSide.BUY, size)
-                 except Exception as e:
-                     logger.error(f"❌ Leg 1 ({long_venue}) Exception: {e}")
-                     o1 = None
+                logger.info(f"-> Executing Leg 1: Buy {size} on {long_venue}")
+                o1 = None
+                o1_error = None
+                try:
+                    if long_venue == 'HYNA':
+                        o1 = await self.hyena.create_order(sym_long, OrderType.MARKET, OrderSide.BUY, size)
+                    elif long_venue == 'VAR':
+                        o1 = await self.variational.create_order(sym_long, OrderType.MARKET, OrderSide.BUY, size)
+                    elif long_venue == 'GRVT':
+                        o1 = await self.grvt.create_order(sym_long, OrderType.MARKET, OrderSide.BUY, size)
+                except Exception as e:
+                    logger.error(f"❌ Leg 1 ({long_venue}) Exception: {e}")
+                    o1_error = e
+                    o1 = None
 
-                 if not o1:
-                     logger.error(f"❌ Leg 1 ({long_venue}) Failed. Aborting Leg 2.")
-                     self.pending_tickers[signal.ticker] = time.time() + 60
-                     return
-                 self._log_trade(o1, long_venue, "entry", exec_signal)
+                if not o1:
+                    logger.error(f"❌ Leg 1 ({long_venue}) Failed. Aborting Leg 2.")
+                    self._apply_entry_failure_cooldown(
+                        signal.ticker, long_venue, o1_error or "order_failed", "entry_leg1"
+                    )
+                    return
+                self._log_trade(o1, long_venue, "entry", exec_signal)
 
-                 logger.info(f"-> Executing Leg 2: Sell {size} on {short_venue}")
-                 o2 = None
-                 try:
-                     if short_venue == 'LGHT':
-                         o2 = await self.lighter.create_order(sym_short, OrderType.MARKET, OrderSide.SELL, size)
-                     elif short_venue == 'VAR':
-                         o2 = await self.variational.create_order(sym_short, OrderType.MARKET, OrderSide.SELL, size)
-                     elif short_venue == 'GRVT':
-                         o2 = await self.grvt.create_order(sym_short, OrderType.MARKET, OrderSide.SELL, size)
-                 except Exception as e:
-                     logger.error(f"❌ Leg 2 ({short_venue}) Exception: {e}")
-                     o2 = None
+                logger.info(f"-> Executing Leg 2: Sell {size} on {short_venue}")
+                o2 = None
+                try:
+                    if short_venue == 'HYNA':
+                        o2 = await self.hyena.create_order(sym_short, OrderType.MARKET, OrderSide.SELL, size)
+                    elif short_venue == 'VAR':
+                        o2 = await self.variational.create_order(sym_short, OrderType.MARKET, OrderSide.SELL, size)
+                    elif short_venue == 'GRVT':
+                        o2 = await self.grvt.create_order(sym_short, OrderType.MARKET, OrderSide.SELL, size)
+                except Exception as e:
+                    logger.error(f"❌ Leg 2 ({short_venue}) Exception: {e}")
+                    o2 = None
 
-                 if o2:
-                     self._log_trade(o2, short_venue, "entry", exec_signal)
+                if o2:
+                    self._log_trade(o2, short_venue, "entry", exec_signal)
 
-                 id1 = o1.id if o1 else 'N/A'
-                 id2 = o2.id if o2 else 'N/A'
-                 logger.info(f"✅ Taker-Taker Entry Complete. IDs: {long_venue}:{id1}, {short_venue}:{id2}")
-                 self.pending_tickers[signal.ticker] = time.time() + 5
-                 return
+                id1 = o1.id if o1 else 'N/A'
+                id2 = o2.id if o2 else 'N/A'
+                logger.info(f"✅ Taker-Taker Entry Complete. IDs: {long_venue}:{id1}, {short_venue}:{id2}")
+                self.pending_tickers[signal.ticker] = time.time() + 5
+                return
 
-             size = plan["size"]
-             hedge_venue = plan["hedge_venue"]
-             grvt_lev = plan["grvt_lev"]
-             target_price = plan["target_price"]
-             target_side = plan["target_side"]
+            size = plan["size"]
+            hedge_venue = plan["hedge_venue"]
+            grvt_lev = plan["grvt_lev"]
+            target_price = plan["target_price"]
+            target_side = plan["target_side"]
 
-             await self._set_leverage_safe("GRVT", grvt_sym, int(grvt_lev))
-             logger.info(f"-> Placing GRVT Maker {target_side} {size} @ {target_price}")
-             order = await self.grvt.create_order(
-                 grvt_sym, OrderType.LIMIT, target_side, size, target_price, params={"post_only": True}
-             )
-             if not order:
-                 logger.error("GRVT Order Placement returned None.")
-                 return
-             self._log_trade(order, "GRVT", "entry_maker", exec_signal)
+            await self._set_leverage_safe("GRVT", grvt_sym, int(grvt_lev))
+            logger.info(f"-> Placing GRVT Maker {target_side} {size} @ {target_price}")
+            try:
+                order = await self.grvt.create_order(
+                    grvt_sym, OrderType.LIMIT, target_side, size, target_price, params={"post_only": True}
+                )
+            except Exception as e:
+                logger.error(f"❌ GRVT create_order failed: {e}")
+                self._apply_entry_failure_cooldown(signal.ticker, "GRVT", e, "entry_maker")
+                return
+            if not order or str(getattr(order, "id", "")) in ("", "0x00") or self._is_grvt_order_rejected(order):
+                logger.error("❌ GRVT maker order rejected/invalid. Skipping entry.")
+                self._apply_entry_failure_cooldown(signal.ticker, "GRVT", getattr(order, "raw", None) or "rejected", "entry_maker")
+                return
+            self._log_trade(order, "GRVT", "entry_maker", exec_signal)
 
-             await self._track_grvt_order(signal.ticker, order, target_side)
-             logger.info("✅ Entry Submitted (Maker order tracked)")
-             self.pending_tickers[signal.ticker] = time.time() + 5
+            hedge_override = None
+            if hedge_side and plan.get("hedge_venue"):
+                hedge_override = {"venue": plan.get("hedge_venue"), "side": hedge_side}
+            await self._track_grvt_order(signal.ticker, order, target_side, hedge_override)
+            logger.info("✅ Entry Submitted (Maker order tracked)")
+            self.pending_tickers[signal.ticker] = time.time() + 5
 
         except Exception as e:
             logger.error(f"Entry Execution Failed: {e}")
@@ -1285,6 +1825,9 @@ class TradingService:
         """
         self.is_processing = True
         logger.info(f"🛑 Executing Exit: {ticker}")
+        ttl = float(getattr(Config, "EXIT_INFLIGHT_TTL_S", 180))
+        if ttl > 0:
+            self.exit_inflight[ticker] = time.time() + ttl
         
         try:
              pos = self.asset_manager.positions.get(ticker)
@@ -1296,19 +1839,24 @@ class TradingService:
              grvt_size = pos.get('GRVT', 0)
              if grvt_size == 0:
                  logger.warning("GRVT leg empty, closing remaining legs only.")
-                 lght_size = pos.get('LGHT', 0)
+                 lght_size = pos.get('HYNA', 0)
                  var_size = pos.get('VAR', 0)
                  if abs(lght_size) > 0:
                      h_side = OrderSide.BUY if lght_size < 0 else OrderSide.SELL
-                     logger.info(f"-> Closing Lighter Leg {h_side} {abs(lght_size)}")
+                     logger.info(f"-> Closing Hyena Leg {h_side} {abs(lght_size)}")
                      sym = f"{ticker}-USDT"
-                     order = await self.lighter.create_order(sym, OrderType.MARKET, h_side, abs(lght_size))
-                     self._log_trade(order, "LGHT", "exit_hedge")
+                     if not self._hyena_ready_for_action(ticker, "exit_hedge"):
+                         self.exit_inflight.pop(ticker, None)
+                         return
+                     order = await self.hyena.create_order(sym, OrderType.MARKET, h_side, abs(lght_size))
+                     self._log_trade(order, "HYNA", "exit_hedge")
                  if abs(var_size) > 0:
                      h_side = OrderSide.BUY if var_size < 0 else OrderSide.SELL
                      logger.info(f"-> Closing VAR Leg {h_side} {abs(var_size)}")
                      order = await self.variational.create_order(ticker, OrderType.MARKET, h_side, abs(var_size))
                      self._log_trade(order, "VAR", "exit_hedge")
+                 cooldown = float(getattr(Config, "EXIT_COMPLETE_COOLDOWN_S", 90))
+                 self.exit_cooldowns[ticker] = time.time() + cooldown
                  return
                  
              # 0. If an exit order is already open, wait before cancel/replace.
@@ -1358,7 +1906,7 @@ class TradingService:
              # Use reduce_only if supported
              logger.info(f"-> Placing GRVT Maker Close ({side}) {abs_size} @ {price}")
              t_side = OrderSide.SELL if side == 'sell' else OrderSide.BUY
-             price = self._compute_grvt_maker_price(ticker, t_side, price)
+             price = self._compute_grvt_exit_price(ticker, t_side, price, 0.0)
              order = await self.grvt.create_order(
                  grvt_sym, OrderType.LIMIT, t_side, abs_size, price, params={"reduce_only": True}
              )
@@ -1398,20 +1946,34 @@ class TradingService:
                  break
 
              if not filled:
-                 logger.info(f"-> GRVT exit order still open for {ticker}; leaving order active")
+                 logger.info(f"-> GRVT exit order still open for {ticker}; tracking for reprice/close")
+                 lght_size = pos.get('HYNA', 0)
+                 var_size = pos.get('VAR', 0)
+                 self.exit_grvt_orders[ticker] = {
+                     "order_id": order.id,
+                     "client_order_id": getattr(order, "client_order_id", None),
+                     "side": t_side,
+                     "size": abs_size,
+                     "created_ts": time.time(),
+                     "lght_size": lght_size,
+                     "var_size": var_size,
+                 }
                  return
                  
              # 4. Hedge Close
              # Find which exchange has the other leg
-             lght_size = pos.get('LGHT', 0)
+             lght_size = pos.get('HYNA', 0)
              var_size = pos.get('VAR', 0)
              
              if abs(lght_size) > 0:
                  h_side = OrderSide.BUY if lght_size < 0 else OrderSide.SELL
-                 logger.info(f"-> Closing Lighter Leg {h_side} {abs(lght_size)}")
+                 logger.info(f"-> Closing Hyena Leg {h_side} {abs(lght_size)}")
                  sym = f"{ticker}-USDT"
-                 order = await self.lighter.create_order(sym, OrderType.MARKET, h_side, abs(lght_size))
-                 self._log_trade(order, "LGHT", "exit_hedge")
+                 if not self._hyena_ready_for_action(ticker, "exit_hedge"):
+                     self.exit_inflight.pop(ticker, None)
+                     return
+                 order = await self.hyena.create_order(sym, OrderType.MARKET, h_side, abs(lght_size))
+                 self._log_trade(order, "HYNA", "exit_hedge")
                  
              if abs(var_size) > 0:
                  h_side = OrderSide.BUY if var_size < 0 else OrderSide.SELL

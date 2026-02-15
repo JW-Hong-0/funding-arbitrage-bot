@@ -13,19 +13,19 @@ class MonitoringService:
     def __init__(
         self,
         grvt: AbstractExchange,
-        lighter: AbstractExchange,
+        hyena: AbstractExchange,
         variational: Optional[AbstractExchange],
         log_manager=None,
     ):
         self.grvt = grvt
-        self.lighter = lighter
+        self.hyena = hyena
         self.variational = variational
         self.log_manager = log_manager
 
-        self.tickers = self._build_ticker_list()
+        self.tickers: List[str] = []
         
         # Data Store
-        self.market_data = {} # {ticker: { 'GRVT': {...}, 'LGHT': {...}, 'VAR': {...} }}
+        self.market_data = {} # {ticker: { 'GRVT': {...}, 'HYNA': {...}, 'VAR': {...} }}
         self.ticker_info = {} # {ticker: { 'min_qty': ..., 'step_size': ... }}
         
         # Strategy Signals
@@ -114,6 +114,7 @@ class MonitoringService:
         
     async def initialize(self):
         logger.info("📡 Monitoring Service Initializing...")
+        self.tickers = self._build_ticker_list()
         logger.info(f"📌 Target tickers: {self.tickers}")
         await self._load_ticker_info()
         
@@ -121,14 +122,6 @@ class MonitoringService:
         logger.info("📡 Subscribing to Market Data Streams...")
         count = 0
         for t in self.tickers:
-            # Lighter (Critical for Funding Rate)
-            lght_sym = f"{t}-USDT"
-            if lght_sym in self.lighter.markets:
-                 # Callback can be a simple cache updater or no-op if Exchange handles cache internally
-                 # LighterExchange updates its own cache, but we pass a callback.
-                 await self.lighter.subscribe_ticker(lght_sym, self._on_lght_update)
-                 count += 1
-                 
             # GRVT (Optional if REST works, but good for latency)
             grvt_sym = f"{t}_USDT_Perp"
             if grvt_sym in self.grvt.markets:
@@ -142,6 +135,8 @@ class MonitoringService:
         if not symbol:
             return ""
         cleaned = symbol.strip().upper()
+        if ":" in cleaned:
+            cleaned = cleaned.split(":", 1)[1]
         for sep in ("-", "/", "_"):
             if sep in cleaned:
                 return cleaned.split(sep, 1)[0]
@@ -158,27 +153,49 @@ class MonitoringService:
 
         exclude = Config.SYMBOL_EXCLUDE or []
         exclude_set = {str(s).strip().upper() for s in exclude if str(s).strip()}
+        auto = bool(getattr(Config, "AUTO_SYMBOLS", False)) or not raw_symbols
 
-        tickers = []
-        seen = set()
-        for sym in raw_symbols:
-            base = self._extract_base_symbol(str(sym))
-            if not base or base in exclude_set or base in seen:
-                continue
-            seen.add(base)
-            tickers.append(base)
+        tickers: List[str] = []
+        if not auto:
+            seen = set()
+            for sym in raw_symbols:
+                base = self._extract_base_symbol(str(sym))
+                if not base or base in exclude_set or base in seen:
+                    continue
+                seen.add(base)
+                tickers.append(base)
+            if tickers:
+                return tickers
 
+        # Auto discovery: include symbols listed on >= N exchanges.
+        min_ex = int(getattr(Config, "AUTO_SYMBOLS_MIN_EXCHANGES", 2) or 2)
+        counts: Dict[str, int] = {}
+
+        def _add_symbol_list(symbols: List[str]):
+            for sym in symbols:
+                base = self._extract_base_symbol(sym)
+                if not base or base in exclude_set:
+                    continue
+                counts[base] = counts.get(base, 0) + 1
+
+        if self.grvt and getattr(self.grvt, "markets", None):
+            _add_symbol_list(list(self.grvt.markets.keys()))
+        if self.hyena and getattr(self.hyena, "markets", None):
+            _add_symbol_list(list(self.hyena.markets.keys()))
+        if self.variational and getattr(self.variational, "markets", None):
+            _add_symbol_list(list(self.variational.markets.keys()))
+
+        tickers = sorted([k for k, v in counts.items() if v >= min_ex])
+        max_symbols = int(getattr(Config, "AUTO_SYMBOLS_MAX", 0) or 0)
+        if max_symbols > 0:
+            tickers = tickers[:max_symbols]
         if not tickers:
             default_tickers = ["AVNT", "IP", "BERA", "RESOLV", "LINK"]
             tickers = [t for t in default_tickers if t not in exclude_set]
-
         return tickers
 
-    async def _on_lght_update(self, ticker_obj):
-        # LighterExchange updates its internal cache before calling this.
-        # We can update self.market_data locally or just let the polling loop fetch from cache.
-        # Polling loop uses fetch_ticker/fetch_funding which reads from Exchange Cache.
-        # So this callback can be lightweight.
+    async def _on_hyna_update(self, ticker_obj):
+        # Hyena adapter currently uses polling only; no-op placeholder.
         pass
 
     async def _on_grvt_update(self, ticker_obj):
@@ -201,17 +218,21 @@ class MonitoringService:
                     'funding_interval_s': getattr(m, "funding_interval_s", None)
                 }
             
-            # 2. Lighter
-            lght_sym = f"{t}-USDT"
-            if lght_sym in self.lighter.markets:
-                 m: MarketInfo = self.lighter.markets[lght_sym]
-                 self.ticker_info[t]['LGHT'] = {
-                    'min_qty': m.min_qty,
-                    'step_size': m.qty_step,
-                    'price_tick': m.price_tick,
-                    'min_notional': getattr(m, "min_notional", None),
-                    'funding_interval_s': getattr(m, "funding_interval_s", None)
-                 }
+            # 2. Hyena
+            if self.hyena:
+                hyna_sym = t
+                pref = f"{getattr(self.hyena, 'dex_id', 'hyna')}:{t}"
+                if pref in self.hyena.markets:
+                    hyna_sym = pref
+                if hyna_sym in self.hyena.markets:
+                    m: MarketInfo = self.hyena.markets[hyna_sym]
+                    self.ticker_info[t]['HYNA'] = {
+                        'min_qty': m.min_qty,
+                        'step_size': m.qty_step,
+                        'price_tick': m.price_tick,
+                        'min_notional': getattr(m, "min_notional", None),
+                        'funding_interval_s': getattr(m, "funding_interval_s", None)
+                    }
 
             # 3. Variational
             if self.variational and t in self.variational.markets:
@@ -272,7 +293,7 @@ class MonitoringService:
         
     async def _fetch_ticker_data(self, ticker):
         """Fetch data for a single ticker from all exchanges via Shared Lib"""
-        data = {'GRVT': {}, 'LGHT': {}, 'VAR': {}}
+        data = {'GRVT': {}, 'HYNA': {}, 'VAR': {}}
         
         # 1. GRVT
         try:
@@ -310,53 +331,43 @@ class MonitoringService:
         except Exception as e:
             logger.debug(f"[{ticker}] GRVT Data Fail: {e}")
 
-        # 2. Lighter
+        # 2. Hyena
         try:
-            lght_sym = f"{ticker}-USDT"
-            # Lighter Shared Lib fetch_ticker returns Ticker object
-            t_obj = await self.lighter.fetch_ticker(lght_sym)
-            # Fetch funding
-            f_obj = await self.lighter.fetch_funding_rate(lght_sym)
-            logger.debug(f"[DEBUG] LGHT {lght_sym} Funding: {f_obj}")
-            
-            if t_obj:
-                 fr = 0.0
-                 nxt = 0
-                 interval_s = 3600
-                 try:
-                     m = self.lighter.markets.get(lght_sym)
-                     if m is not None:
-                         interval_s = getattr(m, "funding_interval_s", interval_s) or interval_s
-                     interval_s = int(getattr(self.lighter, "funding_interval_s", interval_s) or interval_s)
-                 except Exception:
-                     interval_s = 3600
-                 if (t_obj.last or 0) <= 0 or (t_obj.bid or 0) <= 0 or (t_obj.ask or 0) <= 0:
-                     if getattr(Config, "STRATEGY_REBALANCE_DEBUG", False):
-                         logger.info(
-                             f"[LGHT] {lght_sym} ticker zero values: "
-                             f"bid={t_obj.bid} ask={t_obj.ask} last={t_obj.last}"
-                         )
-                     # Fallback to cached values if available.
-                     cached = self.market_data.get(ticker, {}).get("LGHT", {})
-                     if cached:
-                         t_obj.last = t_obj.last or cached.get("price", 0)
-                         t_obj.bid = t_obj.bid or cached.get("bid", 0)
-                         t_obj.ask = t_obj.ask or cached.get("ask", 0)
-                 if f_obj:
-                      # Align with legacy bot logic (rate reported in percent).
-                      fr = f_obj.rate / 100.0
-                      nxt = self._normalize_funding_time_ms(f_obj.next_funding_time)
-                      
-                 data['LGHT'] = {
-                     'price': t_obj.last,
-                     'bid': t_obj.bid,
-                     'ask': t_obj.ask,
-                     'funding_rate': fr,
-                     'next_funding_time': nxt,
-                     'funding_interval_s': interval_s
-                 }
+            if self.hyena and getattr(self.hyena, "markets", None):
+                dex_id = getattr(self.hyena, "dex_id", "hyna")
+                pref = f"{dex_id}:{ticker}"
+                hyna_sym = None
+                if pref in self.hyena.markets:
+                    hyna_sym = pref
+                elif ticker in self.hyena.markets:
+                    hyna_sym = ticker
+
+                if hyna_sym:
+                    t_obj = await self.hyena.fetch_ticker(hyna_sym)
+                    if t_obj and t_obj.last and float(t_obj.last) > 0:
+                        f_obj = await self.hyena.fetch_funding_rate(hyna_sym)
+                        fr = 0.0
+                        nxt = 0
+                        interval_s = 3600
+                        try:
+                            m = self.hyena.markets.get(hyna_sym)
+                            if m is not None:
+                                interval_s = getattr(m, "funding_interval_s", interval_s) or interval_s
+                        except Exception:
+                            interval_s = 3600
+                        if f_obj:
+                            fr = float(f_obj.rate or 0.0)
+                            nxt = self._normalize_funding_time_ms(f_obj.next_funding_time)
+                        data['HYNA'] = {
+                            'price': t_obj.last,
+                            'bid': t_obj.bid,
+                            'ask': t_obj.ask,
+                            'funding_rate': fr,
+                            'next_funding_time': nxt,
+                            'funding_interval_s': interval_s
+                        }
         except Exception as e:
-             logger.debug(f"[{ticker}] LGHT Data Fail: {e}")
+             logger.debug(f"[{ticker}] HYNA Data Fail: {e}")
              
         # 3. Variational
         try:
@@ -408,7 +419,7 @@ class MonitoringService:
             # 1. Gather Prices and Funding Info
             # Structure: { 'price': float, 'funding_rate': float, 'next_funding_time': ms }
             exchanges = {}
-            for ex_name in ['GRVT', 'LGHT', 'VAR']:
+            for ex_name in ['GRVT', 'HYNA', 'VAR']:
                 if mdata.get(ex_name) and mdata[ex_name].get('price', 0) > 0:
                     exchanges[ex_name] = mdata[ex_name]
             
@@ -475,7 +486,7 @@ class MonitoringService:
         for ticker, mdata in self.market_data.items():
             # 1. Gather Valid Venues
             exchanges = {}
-            for ex_name in ['GRVT', 'LGHT', 'VAR']:
+            for ex_name in ['GRVT', 'HYNA', 'VAR']:
                 if mdata.get(ex_name) and mdata[ex_name].get('price', 0) > 0:
                     exchanges[ex_name] = mdata[ex_name]
             

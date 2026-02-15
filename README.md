@@ -1,6 +1,6 @@
 # Funding Arbitrage Bot
 
-GRVT, Lighter, Variational 간 펀딩비 차이를 이용해 델타-중립 헷지 포지션을 구성하는 모듈러 봇이다.
+GRVT, Hyena, Variational 간 펀딩비 차이를 이용해 델타-중립 헷지 포지션을 구성하는 모듈러 봇이다.
 다음 펀딩 이벤트(정각) 기준으로 수익이 가장 큰 조합을 선택하며, 불필요한 진입/청산을 줄이기 위한 히스테리시스와 복구 로직을 포함한다.
 
 ## 구조
@@ -21,7 +21,7 @@ funding_arbitrage_bot/
 - `src/monitoring_service.py`: 시장 데이터/펀딩비 수집, 다음 펀딩 이벤트 기준 전략 신호 계산
 - `src/trading_service.py`: 진입/청산/리밸런싱/헷지 복구
 - `src/asset_manager.py`: 잔고/포지션/오픈오더 집계
-- `libs/shared_crypto_lib`: 거래소 어댑터 (GRVT/Lighter/Variational)
+- `libs/shared_crypto_lib`: 거래소 어댑터 (GRVT/Hyena/Variational)
 
 ## 동작 원리
 
@@ -48,7 +48,7 @@ funding_arbitrage_bot/
 5) 부분 헷지 복구(안전장치)  
    - `PARTIAL_HEDGE` 감지 시 자동 복구 시도
    - 동일 티커 중복 헤지를 막기 위해 inflight TTL 적용
-   - Lighter 주문은 체결 반영 여부를 포지션 스냅샷으로 재확인 후 재시도
+   - Hyena 주문은 체결 반영 여부를 포지션 스냅샷으로 재확인 후 재시도
 
 ## 데이터 흐름
 
@@ -66,14 +66,28 @@ funding_arbitrage_bot/
 
 필수 키(예시):
 - `GRVT_API_KEY`, `GRVT_PRIVATE_KEY`, `GRVT_TRADING_ACCOUNT_ID`, `GRVT_ENV`
-- `LIGHTER_WALLET_ADDRESS`, `LIGHTER_PRIVATE_KEY`, `LIGHTER_PUBLIC_KEY`, `LIGHTER_ENV`
+- `HYENA_PRIVATE_KEY` (또는 `HYPERLIQUID_PRIVATE_KEY`)
+- (선택) `HYENA_WALLET_ADDRESS`, `HYENA_MAIN_ADDRESS`, `HYENA_DEX_ID=hyna`
+- (선택) `HYENA_BUILDER_ADDRESS`, `HYENA_BUILDER_FEE`, `HYENA_BUILDER_MAX_FEE_RATE`
 - `VARIATIONAL_WALLET_ADDRESS`, `VARIATIONAL_VR_TOKEN` (선택), `VARIATIONAL_PRIVATE_KEY`
+
+전체 페어 자동 스캔:
+```
+AUTO_SYMBOLS=1
+AUTO_SYMBOLS_MIN_EXCHANGES=2
+AUTO_SYMBOLS_MAX=0   # 0이면 제한 없음
+```
 
 ## 실행
 
 ```
 cd /home/jeonguk/projects/Perp_DEX/bots/funding_arbitrage_bot
 .venv/bin/python -m src.main_modular
+```
+
+UI를 켜려면:
+```
+UI_ENABLED=1 UI_PORT=8080 .venv/bin/python -m src.main_modular
 ```
 
 ## 서브모듈 동작
@@ -107,7 +121,6 @@ git submodule update --init --recursive
 
 ## 주의사항
 
-- WS 정책상 **ping/pong 로직** 필요 (Lighter)
 - 네트워크 오류(401/timeout) 시 쿨다운 로직 적용
 - 실제 주문이 들어가므로 운영 전 소액/검증 권장
 
@@ -122,7 +135,6 @@ git submodule update --init --recursive
 로컬 SDK 경로 사용 권장:
 ```
 .venv/bin/pip install -e /path/to/grvt-pysdk --no-build-isolation
-.venv/bin/pip install -e /path/to/lighter-python --no-build-isolation
 ```
 
 ## HyENA 테스트
